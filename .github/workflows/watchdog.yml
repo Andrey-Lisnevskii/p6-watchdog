@@ -1,0 +1,34 @@
+name: Watchdog
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Прислать тестовое сообщение в личный чат"
+        type: boolean
+        default: false
+
+concurrency: watchdog
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: watchdog-state-none
+          restore-keys: watchdog-state-
+      - run: python watchdog.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
+          TEST_ALERT: ${{ inputs.test_alert && '1' || '' }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: watchdog-state-${{ github.run_id }}
