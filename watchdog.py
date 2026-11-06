@@ -85,10 +85,12 @@ def check_runs(now_utc, working):
                                    f"(последний запуск {parse(last['created_at']).astimezone(MSK):%H:%M}). "
                                    f"Проверьте задание в cron-job.org и лимит минут GitHub.")
     done = [r for r in runs if r["status"] == "completed"]
-    if done and done[0]["conclusion"] not in ("success", "skipped", "cancelled"):
+    bad = ("failure", "timed_out", "startup_failure")
+    # одиночный сбой (например, обрыв IMAP у mail.ru) не тревожит: агент перезапускается сам каждые 6 минут
+    if len(done) >= 2 and done[0]["conclusion"] in bad and done[1]["conclusion"] in bad:
         r = done[0]
-        problems["failed"] = (f"Запуск агента завершился ошибкой ({r['conclusion']}) в "
-                              f"{parse(r['created_at']).astimezone(MSK):%H:%M}: {r['html_url']}")
+        problems["failed"] = (f"Два запуска агента подряд завершились ошибкой (последний в "
+                              f"{parse(r['created_at']).astimezone(MSK):%H:%M}): {r['html_url']}")
     return problems, (done[0] if done else None)
 
 
