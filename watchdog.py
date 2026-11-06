@@ -22,6 +22,7 @@ GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "-1004300461257")
 MSK = ZoneInfo("Europe/Moscow")
 WORK_START, WORK_END = (9, 30), (17, 30)
 MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "20"))
+MIN_LEFT_ALERT = int(os.environ.get("MIN_LEFT_ALERT", "100"))
 REPEAT_MIN = 60          # повтор той же тревоги не чаще раза в час
 STATE_FILE = "state.json"
 TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось")
@@ -107,6 +108,41 @@ def check_telegram_in_log(run):
     return {}
 
 
+def minutes_used(now_utc):
+    """Оценка израсходованных минут Actions в закрытом репозитории агента за текущий месяц.
+    Каждый запуск округляется вверх до целой минуты (как биллинг GitHub для одного job)."""
+    since = now_utc.strftime("%Y-%m-01")
+    total, page = 0, 1
+    while page <= 40:
+        runs = gh(f"/repos/{AGENT_REPO}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
+                  ).get("workflow_runs", [])
+        for r in runs:
+            if r["status"] != "completed" or not r.get("run_started_at"):
+                continue
+            sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
+            total += max(1, -(-int(sec) // 60))
+        if len(runs) < 100:
+            break
+        page += 1
+    return total + int(os.environ.get("MINUTES_OFFSET", "0"))
+
+
+def check_minutes(now_utc):
+    quota = int(os.environ.get("MINUTES_QUOTA", "2000"))
+    try:
+        used = minutes_used(now_utc)
+    except Exception as e:
+        print("минуты: не удалось посчитать:", e)
+        return {}
+    left = quota - used
+    print(f"минуты Actions: израсходовано ~{used}, осталось ~{left} из {quota}")
+    if left < MIN_LEFT_ALERT:
+        return {"minutes": (f"Бесплатные минуты GitHub Actions почти закончились: осталось около {max(left, 0)} "
+                            f"из {quota} (оценка по длительности запусков). Агент остановится, когда лимит кончится. "
+                            f"Реже запускайте агента или проверьте https://github.com/settings/billing/summary")}
+    return {}
+
+
 def check_bot():
     problems = {}
     try:
@@ -139,6 +175,7 @@ def main():
     problems.update(run_problems)
     problems.update(check_telegram_in_log(last_done) if working else {})
     problems.update(check_bot())
+    problems.update(check_minutes(now_utc))
 
     try:
         state = json.load(open(STATE_FILE))
@@ -147,7 +184,8 @@ def main():
     new_state, lines = {}, []
     for key, text in problems.items():
         last = state.get(key)
-        if not last or (now_utc.timestamp() - last) / 60 >= REPEAT_MIN:
+        repeat = 360 if key == "minutes" else REPEAT_MIN
+        if not last or (now_utc.timestamp() - last) / 60 >= repeat:
             lines.append("⚠️ " + text)
             new_state[key] = now_utc.timestamp()
         else:
