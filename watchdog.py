@@ -62,6 +62,15 @@ def tg(method, **params):
     raise last
 
 
+def is_workday(now):
+    if now.weekday() >= 5:
+        return False
+    try:  # производственный календарь: 1 — выходной
+        return http(f"https://isdayoff.ru/{now:%Y%m%d}", raw=True).decode().strip() != "1"
+    except Exception:
+        return True
+
+
 def is_working_time(now):
     if now.weekday() >= 5:
         return False
@@ -316,7 +325,7 @@ def build_summary(day, now):
     for n in sorted(orders):
         total, done = len(orders[n]), len(closed.get(n, set()) & orders[n])
         (full if done == total else part if done else none).append((n, done, total))
-    final = (now.hour, now.minute) >= WORK_END
+    final = True
     head = f"<b>{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M}</b>"
     if not orders:
         return head + "\n\nЗаявок пока нет."
@@ -351,6 +360,7 @@ def main():
     now_utc = datetime.now(timezone.utc)
     now = now_utc.astimezone(MSK)
     working = is_working_time(now)
+    workday = is_workday(now)
     problems = {}
     run_problems, last_done = check_runs(now_utc, working)
     problems.update(run_problems)
@@ -366,7 +376,8 @@ def main():
         state = {"alerts": {k: v for k, v in state.items() if isinstance(v, (int, float))}}
     old_alerts = state["alerts"]
     events = []
-    if working or "scanned" not in state:
+    scan_window = workday and WORK_START <= (now.hour, now.minute) <= (18, 30)
+    if scan_window or "scanned" not in state:
         try:
             events = scan_agent_logs(state, now_utc)
         except Exception as e:
@@ -388,13 +399,13 @@ def main():
     lines += events
     summary = None
     day = state.get("day")
-    if day and (working or os.environ.get("TEST_ALERT")):
-        slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
-        due = now.minute % 30 < 15 and day.get("slot") != slot and (now.hour, now.minute) >= WORK_START
+    if day:
+        # один раз в день, в 18:00 (первый запуск после 18:00 в рабочий день)
+        due = workday and (now.hour, now.minute) >= (18, 0) and not day.get("final_sent")
         if due or os.environ.get("TEST_ALERT"):
             summary = build_summary(day, now)
             if due:
-                day["slot"] = slot
+                day["final_sent"] = True
     state["alerts"] = new_alerts
     print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} события={len(events)} отправляем={len(lines)}")
     if lines:
