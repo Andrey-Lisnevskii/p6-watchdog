@@ -183,6 +183,7 @@ def check_bot():
 TS_RE = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z ")
 LETTER_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| вложения: .*? \| тип: (?P<kind>order|reply) \| поставщик П(?P<n>\d+)")
 NONE_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| тип: order \| поставщик ПNone")
+CLOSE_RE = re.compile(r"Сверка П(?P<n>\d+): заявка (?P<t>\d\d:\d\d)(?!\d)")
 REMIND_RE = re.compile(r"Напоминание (?P<k>\d) отправлено П(?P<n>\d+) на (?P<addr>\S+)")
 SEEN_TTL_H = 12
 
@@ -211,6 +212,9 @@ def scan_agent_logs(state, now_utc):
         day = state["day"] = {"date": today.isoformat(), "orders": {}, "replies": {}, "backfilled": False, "slot": -1}
     if not day["backfilled"]:
         scanned = set()  # заново читаем все запуски дня, чтобы собрать заявки и ответы с начала дня
+    if "closed" not in day:  # данные дня собраны старой версией: читаем запуски дня заново
+        day["closed"], day["backfilled"] = {}, False
+        scanned = set()
     day_start = datetime.combine(today, datetime.min.time(), MSK).replace(hour=6).astimezone(timezone.utc)
     since = day_start if not day["backfilled"] else now_utc - timedelta(hours=2)
     found, page = [], 1
@@ -257,6 +261,12 @@ def scan_agent_logs(state, now_utc):
                 cur = replies.get(m["n"])
                 if not cur or dt.isoformat() > cur["dt"]:
                     replies[m["n"]] = {"dt": dt.isoformat(), "subj": m["subj"][:60]}
+        if any("DRY_RUN: true" in l for l in lines):
+            continue  # проверочные запуски ничего не закрывают
+        for line in lines:
+            mc = CLOSE_RE.search(line)
+            if mc:
+                day.setdefault("closed", {})[f"{mc['n']}|{mc['t']}"] = int(mc["n"])
     day["backfilled"] = True
     events = []
 
@@ -293,25 +303,34 @@ def scan_agent_logs(state, now_utc):
 
 
 def build_summary(day, now):
-    orders, replies = {}, {}
-    for n in day["orders"].values():
-        orders[n] = orders.get(n, 0) + 1
-    for n in day["replies"].values():
-        replies[n] = replies.get(n, 0) + 1
-    nums = sorted(set(orders) | set(replies))
+    """Заявки по поставщикам: сколько отправлено и сколько закрыто сверкой; три группы."""
+    orders = {}  # номер -> множество «чч:мм» заявок
+    for key, n in day["orders"].items():
+        orders.setdefault(n, set()).add(datetime.fromisoformat(key.split("|")[0]).strftime("%H:%M"))
+    closed = {}
+    for key, n in day.get("closed", {}).items():
+        t = key.split("|")[1]
+        closed.setdefault(n, set()).add(t)
+        orders.setdefault(n, set()).add(t)  # закрытая заявка точно была (например, у П6 в теме нет адреса)
+    full, part, none = [], [], []
+    for n in sorted(orders):
+        total, done = len(orders[n]), len(closed.get(n, set()) & orders[n])
+        (full if done == total else part if done else none).append((n, done, total))
     final = (now.hour, now.minute) >= WORK_END
-    head = f"{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M} (с начала дня)"
-    if not nums:
-        return head + "\n\nЗаявок и ответов пока нет."
-    rows = []
-    for n in nums:
-        o, r = orders.get(n, 0), replies.get(n, 0)
-        rows.append(f"П{n}: заявок {o}, ответов {r}" + (" ⏳" if o > r else ""))
-    total = f"Всего: заявок {sum(orders.values())}, ответов {sum(replies.values())}"
-    none = len(day.get("orders_none", {}))
-    if none:
-        total += f"\nЕщё заявок без адреса поставщика в теме (не учтены в списке): {none}"
-    return head + "\n\n" + "\n".join(rows) + "\n\n" + total + "\n⏳ — ответов меньше, чем заявок"
+    head = f"{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M}"
+    if not orders:
+        return head + "\n\nЗаявок пока нет."
+    out = [head, ""]
+    out.append(f"✅ Ответили на все ({len(full)}): " + (", ".join(f"П{n} ({d}/{t})" for n, d, t in full) or "—"))
+    out.append(f"🟡 Ответили частично ({len(part)}): " + (", ".join(f"П{n} ({d} из {t})" for n, d, t in part) or "—"))
+    out.append(f"❌ Не отвечают ({len(none)}): " + (", ".join(f"П{n} (0 из {t})" for n, d, t in none) or "—"))
+    all_t = sum(t for _, _, t in full + part + none)
+    all_d = sum(d for _, d, _ in full + part + none)
+    out += ["", f"Заявок отправлено: {all_t}, закрыто сверкой: {all_d}"]
+    extra = len(day.get("orders_none", {}))
+    if extra:
+        out.append(f"Ещё заявок без адреса поставщика в теме: {extra} (в списке выше могут быть не учтены)")
+    return "\n".join(out)
 
 
 def parse_iso(ts):
