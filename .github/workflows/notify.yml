@@ -1,0 +1,27 @@
+name: Notify
+
+# Отправляет произвольный текст в личный чат (ALERT_CHAT_ID) от имени бота.
+# Запускается вручную или по API (workflow_dispatch) — например, задачей «Скорость закупки».
+
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Текст сообщения в личный чат"
+        type: string
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
+          MESSAGE: ${{ inputs.text }}
+        run: |
+          curl -sS --fail-with-body \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${ALERT_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE:0:3500}" > /dev/null
