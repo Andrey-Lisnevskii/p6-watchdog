@@ -12,7 +12,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import hashlib
+import re
 import zipfile
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -168,6 +171,92 @@ def check_bot():
     return problems
 
 
+TS_RE = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z ")
+REPLY_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| тип: reply \| поставщик П(?P<n>\d+)")
+REMIND_RE = re.compile(r"Напоминание (?P<k>\d) отправлено П(?P<n>\d+) на (?P<addr>\S+)")
+SEEN_TTL_H = 12
+
+
+def run_lines(run):
+    z = zipfile.ZipFile(io.BytesIO(gh(f"/repos/{AGENT_REPO}/actions/runs/{run['id']}/logs", raw=True)))
+    out = []
+    for name in z.namelist():
+        for raw in z.read(name).decode("utf-8", "ignore").splitlines():
+            parts = raw.split("\t", 2)
+            line = parts[2] if len(parts) == 3 else raw
+            out.append(TS_RE.sub("", line).strip())
+    return out
+
+
+def scan_agent_logs(state, now_utc):
+    """Новые запуски агента: непонятые письма и напоминания поставщикам, которые уже писали сегодня.
+    При первом запуске только запоминает состояние (старое не присылаем)."""
+    first = "scanned" not in state
+    scanned = set(state.get("scanned", []))
+    replies = state.setdefault("replies", {})
+    seen = state.setdefault("seen", {})
+    since = now_utc - timedelta(hours=3 if first else 2)
+    data = gh(f"/repos/{AGENT_REPO}/actions/workflows/{AGENT_WORKFLOW}/runs?per_page=60"
+              f"&created=%3E%3D{since:%Y-%m-%dT%H:%M:%SZ}")
+    runs = sorted((r for r in data.get("workflow_runs", [])
+                   if r["status"] == "completed" and str(r["id"]) not in scanned),
+                  key=lambda r: r["created_at"])
+    today = now_utc.astimezone(MSK).date()
+    logs = []
+    for r in runs:
+        try:
+            logs.append((r, run_lines(r)))
+        except Exception as e:
+            print(f"лог запуска {r['id']} не прочитан: {e}")
+    for r, lines in logs:  # 1) письма-ответы поставщиков за сегодня
+        for line in lines:
+            m = REPLY_RE.match(line)
+            if not m:
+                continue
+            try:
+                dt = parsedate_to_datetime(m["date"].strip()).astimezone(MSK)
+            except Exception:
+                continue
+            if dt.date() == today:
+                cur = replies.get(m["n"])
+                if not cur or dt.isoformat() > cur["dt"]:
+                    replies[m["n"]] = {"dt": dt.isoformat(), "subj": m["subj"][:60]}
+    events = []
+
+    def once(text):
+        key = hashlib.md5(text.encode()).hexdigest()[:12]
+        if key in seen and (now_utc.timestamp() - seen[key]) / 3600 < SEEN_TTL_H:
+            return False
+        seen[key] = now_utc.timestamp()
+        return True
+
+    for r, lines in logs:  # 2) события
+        rt = parse(r["created_at"]).astimezone(MSK)
+        for line in lines:
+            if line.startswith("⚠️") and "в чат не отправляется" in line:
+                text = line.split(" — в чат")[0]
+                if once(text):
+                    events.append(f"ℹ️ Агент не смог разобрать письмо, в чат отдела оно не ушло. {text[2:].strip()} ({r['html_url']})")
+                continue
+            m = REMIND_RE.search(line)
+            if m:
+                rep = replies.get(m["n"])
+                if rep and rep["dt"] < rt.isoformat():
+                    text = (f"Напоминание поставщику П{m['n']} ушло в {rt:%H:%M}, хотя сегодня от него уже есть письмо "
+                            f"({parse_iso(rep['dt']):%H:%M}, «{rep['subj']}»). Проверьте, не ответил ли он по существу")
+                    if once(text):
+                        events.append("⚠️ " + text)
+    scanned |= {str(r["id"]) for r, _ in logs}
+    state["scanned"] = sorted(scanned, key=int)[-300:]
+    state["seen"] = {k: v for k, v in seen.items() if (now_utc.timestamp() - v) / 3600 < SEEN_TTL_H * 2}
+    state["replies"] = {n: v for n, v in replies.items() if v["dt"][:10] == today.isoformat()}
+    return [] if first else events
+
+
+def parse_iso(ts):
+    return datetime.fromisoformat(ts)
+
+
 def main():
     now_utc = datetime.now(timezone.utc)
     now = now_utc.astimezone(MSK)
@@ -183,23 +272,36 @@ def main():
         state = json.load(open(STATE_FILE))
     except Exception:
         state = {}
-    new_state, lines = {}, []
+    if "alerts" not in state:  # старый формат: плоский словарь «тревога -> время»
+        state = {"alerts": {k: v for k, v in state.items() if isinstance(v, (int, float))}}
+    old_alerts = state["alerts"]
+    events = []
+    if working or "scanned" not in state:
+        try:
+            events = scan_agent_logs(state, now_utc)
+        except Exception as e:
+            print("разбор логов агента не удался:", e)
+    new_alerts, lines = {}, []
     for key, text in problems.items():
-        last = state.get(key)
+        last = old_alerts.get(key)
         repeat = 360 if key == "minutes" else REPEAT_MIN
         if not last or (now_utc.timestamp() - last) / 60 >= repeat:
             lines.append("⚠️ " + text)
-            new_state[key] = now_utc.timestamp()
+            new_alerts[key] = now_utc.timestamp()
         else:
-            new_state[key] = last
-    resolved = [k for k in state if k not in problems]
+            new_alerts[key] = last
+    resolved = [k for k in old_alerts if k not in problems]
     if resolved:
         lines.append("✅ Восстановилось: " + ", ".join(resolved))
-    print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} отправляем={len(lines)}")
+    if len(events) > 8:
+        events = events[:8] + [f"…и ещё {len(events) - 8} событий, смотрите логи агента"]
+    lines += events
+    state["alerts"] = new_alerts
+    print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} события={len(events)} отправляем={len(lines)}")
     if lines:
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж агента\n\n" + "\n\n".join(lines),
            disable_web_page_preview=True)
-    json.dump(new_state, open(STATE_FILE, "w"))
+    json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж: тестовое сообщение. Канал тревог работает.")
 
