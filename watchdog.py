@@ -172,7 +172,7 @@ def check_bot():
 
 
 TS_RE = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z ")
-REPLY_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| тип: reply \| поставщик П(?P<n>\d+)")
+LETTER_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| вложения: .*? \| тип: (?P<kind>order|reply) \| поставщик П(?P<n>\d+)")
 REMIND_RE = re.compile(r"Напоминание (?P<k>\d) отправлено П(?P<n>\d+) на (?P<addr>\S+)")
 SEEN_TTL_H = 12
 
@@ -195,32 +195,51 @@ def scan_agent_logs(state, now_utc):
     scanned = set(state.get("scanned", []))
     replies = state.setdefault("replies", {})
     seen = state.setdefault("seen", {})
-    since = now_utc - timedelta(hours=3 if first else 2)
-    data = gh(f"/repos/{AGENT_REPO}/actions/workflows/{AGENT_WORKFLOW}/runs?per_page=60"
-              f"&created=%3E%3D{since:%Y-%m-%dT%H:%M:%SZ}")
-    runs = sorted((r for r in data.get("workflow_runs", [])
-                   if r["status"] == "completed" and str(r["id"]) not in scanned),
-                  key=lambda r: r["created_at"])
     today = now_utc.astimezone(MSK).date()
+    day = state.get("day")
+    if not day or day.get("date") != today.isoformat():
+        day = state["day"] = {"date": today.isoformat(), "orders": {}, "replies": {}, "backfilled": False, "slot": -1}
+    if not day["backfilled"]:
+        scanned = set()  # заново читаем все запуски дня, чтобы собрать заявки и ответы с начала дня
+    day_start = datetime.combine(today, datetime.min.time(), MSK).replace(hour=6).astimezone(timezone.utc)
+    since = day_start if not day["backfilled"] else now_utc - timedelta(hours=2)
+    found, page = [], 1
+    while page <= 4:  # за день бывает до ~100 запусков
+        data = gh(f"/repos/{AGENT_REPO}/actions/workflows/{AGENT_WORKFLOW}/runs?per_page=100&page={page}"
+                  f"&created=%3E%3D{since:%Y-%m-%dT%H:%M:%SZ}")
+        found += data.get("workflow_runs", [])
+        if len(data.get("workflow_runs", [])) < 100:
+            break
+        page += 1
+    runs = sorted((r for r in found if r["status"] == "completed" and str(r["id"]) not in scanned),
+                  key=lambda r: r["created_at"])
+    recent = now_utc - timedelta(hours=2)
     logs = []
     for r in runs:
         try:
             logs.append((r, run_lines(r)))
         except Exception as e:
             print(f"лог запуска {r['id']} не прочитан: {e}")
-    for r, lines in logs:  # 1) письма-ответы поставщиков за сегодня
+    for r, lines in logs:  # 1) заявки и ответы поставщиков за сегодня
         for line in lines:
-            m = REPLY_RE.match(line)
+            m = LETTER_RE.match(line)
             if not m:
                 continue
             try:
                 dt = parsedate_to_datetime(m["date"].strip()).astimezone(MSK)
             except Exception:
                 continue
-            if dt.date() == today:
+            if dt.date() != today:
+                continue
+            key = f"{dt.isoformat()}|{m['n']}|{m['subj'][:40]}"
+            if m["kind"] == "order":
+                day["orders"][key] = int(m["n"])
+            else:
+                day["replies"][key] = int(m["n"])
                 cur = replies.get(m["n"])
                 if not cur or dt.isoformat() > cur["dt"]:
                     replies[m["n"]] = {"dt": dt.isoformat(), "subj": m["subj"][:60]}
+    day["backfilled"] = True
     events = []
 
     def once(text):
@@ -230,7 +249,9 @@ def scan_agent_logs(state, now_utc):
         seen[key] = now_utc.timestamp()
         return True
 
-    for r, lines in logs:  # 2) события
+    for r, lines in logs:  # 2) события (только по недавним запускам)
+        if parse(r["created_at"]) < recent:
+            continue
         rt = parse(r["created_at"]).astimezone(MSK)
         for line in lines:
             if line.startswith("⚠️") and "в чат не отправляется" in line:
@@ -251,6 +272,25 @@ def scan_agent_logs(state, now_utc):
     state["seen"] = {k: v for k, v in seen.items() if (now_utc.timestamp() - v) / 3600 < SEEN_TTL_H * 2}
     state["replies"] = {n: v for n, v in replies.items() if v["dt"][:10] == today.isoformat()}
     return [] if first else events
+
+
+def build_summary(day, now):
+    orders, replies = {}, {}
+    for n in day["orders"].values():
+        orders[n] = orders.get(n, 0) + 1
+    for n in day["replies"].values():
+        replies[n] = replies.get(n, 0) + 1
+    nums = sorted(set(orders) | set(replies))
+    final = (now.hour, now.minute) >= WORK_END
+    head = f"{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M} (с начала дня)"
+    if not nums:
+        return head + "\n\nЗаявок и ответов пока нет."
+    rows = []
+    for n in nums:
+        o, r = orders.get(n, 0), replies.get(n, 0)
+        rows.append(f"П{n}: заявок {o}, ответов {r}" + (" ⏳" if o > r else ""))
+    total = f"Всего: заявок {sum(orders.values())}, ответов {sum(replies.values())}"
+    return head + "\n\n" + "\n".join(rows) + "\n\n" + total + "\n⏳ — ответов меньше, чем заявок"
 
 
 def parse_iso(ts):
@@ -296,11 +336,22 @@ def main():
     if len(events) > 8:
         events = events[:8] + [f"…и ещё {len(events) - 8} событий, смотрите логи агента"]
     lines += events
+    summary = None
+    day = state.get("day")
+    if day and (working or os.environ.get("TEST_ALERT")):
+        slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
+        due = now.minute % 30 < 15 and day.get("slot") != slot and (now.hour, now.minute) >= WORK_START
+        if due or os.environ.get("TEST_ALERT"):
+            summary = build_summary(day, now)
+            if due:
+                day["slot"] = slot
     state["alerts"] = new_alerts
     print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} события={len(events)} отправляем={len(lines)}")
     if lines:
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж агента\n\n" + "\n\n".join(lines),
            disable_web_page_preview=True)
+    if summary:
+        tg("sendMessage", chat_id=ALERT_CHAT, text=summary)
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж: тестовое сообщение. Канал тревог работает.")
