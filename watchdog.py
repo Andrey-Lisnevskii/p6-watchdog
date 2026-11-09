@@ -182,6 +182,7 @@ def check_bot():
 
 TS_RE = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z ")
 LETTER_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| вложения: .*? \| тип: (?P<kind>order|reply) \| поставщик П(?P<n>\d+)")
+NONE_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .*? \| тип: order \| поставщик ПNone")
 REMIND_RE = re.compile(r"Напоминание (?P<k>\d) отправлено П(?P<n>\d+) на (?P<addr>\S+)")
 SEEN_TTL_H = 12
 
@@ -233,6 +234,14 @@ def scan_agent_logs(state, now_utc):
         for line in lines:
             m = LETTER_RE.match(line)
             if not m:
+                mn = NONE_RE.match(line)
+                if mn:
+                    try:
+                        dtn = parsedate_to_datetime(mn["date"].strip()).astimezone(MSK)
+                    except Exception:
+                        continue
+                    if dtn.date() == today:
+                        day.setdefault("orders_none", {})[f"{dtn.isoformat()}|{mn['subj'][:40]}"] = 1
                 continue
             try:
                 dt = parsedate_to_datetime(m["date"].strip()).astimezone(MSK)
@@ -299,6 +308,9 @@ def build_summary(day, now):
         o, r = orders.get(n, 0), replies.get(n, 0)
         rows.append(f"П{n}: заявок {o}, ответов {r}" + (" ⏳" if o > r else ""))
     total = f"Всего: заявок {sum(orders.values())}, ответов {sum(replies.values())}"
+    none = len(day.get("orders_none", {}))
+    if none:
+        total += f"\nЕщё заявок без адреса поставщика в теме (не учтены в списке): {none}"
     return head + "\n\n" + "\n".join(rows) + "\n\n" + total + "\n⏳ — ответов меньше, чем заявок"
 
 
