@@ -352,6 +352,7 @@ def main():
            disable_web_page_preview=True)
     if summary:
         tg("sendMessage", chat_id=ALERT_CHAT, text=summary)
+        print("сводка отправлена:", summary.replace("\n", " | ")[:400])
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж: тестовое сообщение. Канал тревог работает.")
