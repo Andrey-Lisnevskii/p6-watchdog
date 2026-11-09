@@ -317,19 +317,29 @@ def build_summary(day, now):
         total, done = len(orders[n]), len(closed.get(n, set()) & orders[n])
         (full if done == total else part if done else none).append((n, done, total))
     final = (now.hour, now.minute) >= WORK_END
-    head = f"{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M}"
+    head = f"<b>{'Итог дня' if final else 'Сводка'} по поставщикам, {now:%H:%M}</b>"
     if not orders:
         return head + "\n\nЗаявок пока нет."
-    out = [head, ""]
-    out.append(f"✅ Ответили на все ({len(full)}): " + (", ".join(f"П{n} ({d}/{t})" for n, d, t in full) or "—"))
-    out.append(f"🟡 Ответили частично ({len(part)}): " + (", ".join(f"П{n} ({d} из {t})" for n, d, t in part) or "—"))
-    out.append(f"❌ Не отвечают ({len(none)}): " + (", ".join(f"П{n} (0 из {t})" for n, d, t in none) or "—"))
     all_t = sum(t for _, _, t in full + part + none)
     all_d = sum(d for _, d, _ in full + part + none)
-    out += ["", f"Заявок отправлено: {all_t}, закрыто сверкой: {all_d}"]
+    out = [head, f"Заявок отправлено: {all_t} · закрыто: {all_d} · не закрыто: {all_t - all_d}", ""]
+    out.append(f"✅ <b>Ответили на все ({len(full)})</b>")
+    out.append(", ".join(f"П{n}" for n, _, _ in full) or "—")
+    out.append("")
+    out.append(f"🟡 <b>Ответили частично ({len(part)})</b>")
+    for n, d, t in sorted(part, key=lambda x: (x[1] - x[2], x[0])):
+        out.append(f"П{n} — закрыто {d} из {t}, осталось {t - d}")
+    if not part:
+        out.append("—")
+    out.append("")
+    out.append(f"❌ <b>Не отвечают ({len(none)})</b>")
+    for n, d, t in sorted(none, key=lambda x: (-x[2], x[0])):
+        out.append(f"П{n} — заявок {t}, закрыто 0")
+    if not none:
+        out.append("—")
     extra = len(day.get("orders_none", {}))
     if extra:
-        out.append(f"Ещё заявок без адреса поставщика в теме: {extra} (в списке выше могут быть не учтены)")
+        out += ["", f"Ещё {extra} заявок без адреса поставщика в теме, в списке могут быть не учтены."]
     return "\n".join(out)
 
 
@@ -391,7 +401,7 @@ def main():
         tg("sendMessage", chat_id=ALERT_CHAT, text="Страж агента\n\n" + "\n\n".join(lines),
            disable_web_page_preview=True)
     if summary:
-        tg("sendMessage", chat_id=ALERT_CHAT, text=summary)
+        tg("sendMessage", chat_id=ALERT_CHAT, text=summary, parse_mode="HTML")
         print("сводка отправлена:", summary.replace("\n", " | ")[:400])
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
