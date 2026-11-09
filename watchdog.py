@@ -49,8 +49,17 @@ def gh(path, raw=False):
 
 
 def tg(method, **params):
-    return http(f"https://api.telegram.org/bot{TOKEN}/{method}",
-                {"Content-Type": "application/json"}, json.dumps(params).encode())
+    last = None
+    for attempt in range(4):  # обрывы соединения с Telegram бывают разовыми
+        try:
+            return http(f"https://api.telegram.org/bot{TOKEN}/{method}",
+                        {"Content-Type": "application/json"}, json.dumps(params).encode())
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise last
 
 
 def is_working_time(now):
