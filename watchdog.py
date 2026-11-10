@@ -99,8 +99,10 @@ def send_bitrix(text, html=False):
     if html:
         text = re.sub(r"</?b>", lambda m: "[/b]" if m.group(0).startswith("</") else "[b]", text)
         text = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-    bitrix_call("imbot.message.add", {"BOT_ID": bot, "CLIENT_ID": BITRIX_CLIENT_ID,
+    print("Битрикс24: адресат", bitrix_dialog(), "бот", bot)
+    res = bitrix_call("imbot.message.add", {"BOT_ID": bot, "CLIENT_ID": BITRIX_CLIENT_ID,
                                       "DIALOG_ID": bitrix_dialog(), "MESSAGE": text, "URL_PREVIEW": "N"})
+    print("Битрикс24: ответ", res)
 
 
 def notify(text, html=False):
