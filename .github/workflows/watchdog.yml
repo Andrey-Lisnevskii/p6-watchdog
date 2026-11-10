@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       test_alert:
-        description: "Прислать тестовое сообщение в личный чат"
+        description: "Прислать тестовое сообщение в Битрикс24"
         type: boolean
         default: false
 
@@ -24,6 +24,8 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+          BITRIX_WEBHOOK: ${{ secrets.BITRIX_WEBHOOK }}
+          BITRIX_ALERT_DIALOG: ${{ secrets.BITRIX_ALERT_DIALOG }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
           TEST_ALERT: ${{ inputs.test_alert && '1' || '' }}

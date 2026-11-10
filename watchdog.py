@@ -3,7 +3,9 @@
 Только читает: статус запусков через GitHub API и состояние бота через Telegram API.
 Тревоги шлёт в личный чат (ALERT_CHAT_ID). В чат отдела ничего не отправляется.
 
-Секреты: GH_READ_TOKEN, TELEGRAM_BOT_TOKEN, ALERT_CHAT_ID.
+Секреты: GH_READ_TOKEN, BITRIX_WEBHOOK (тревоги и сводка идут в Битрикс24 личным сообщением
+от бота «Helper for 1St» владельцу вебхука; другой адресат — BITRIX_ALERT_DIALOG, id пользователя
+или chatNNN). TELEGRAM_BOT_TOKEN и ALERT_CHAT_ID — запасной канал, если Битрикс не настроен или не отвечает.
 """
 import io
 import json
@@ -28,10 +30,13 @@ MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "20"))
 MIN_LEFT_ALERT = int(os.environ.get("MIN_LEFT_ALERT", "100"))
 REPEAT_MIN = 60          # повтор той же тревоги не чаще раза в час
 STATE_FILE = "state.json"
-TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось")
+TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось", "Битрикс24: не отправлено")
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALERT_CHAT = os.environ["ALERT_CHAT_ID"]
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ALERT_CHAT = os.environ.get("ALERT_CHAT_ID", "")
+BITRIX = os.environ.get("BITRIX_WEBHOOK", "").strip().rstrip("/")
+BITRIX_BOT_CODE = "helper_for_1st"
+BITRIX_CLIENT_ID = "p6reminder_helper_for_1st"  # как у агента: бот один и тот же
 GH = os.environ["GH_READ_TOKEN"]
 
 
@@ -60,6 +65,57 @@ def tg(method, **params):
             last = e
             time.sleep(2 * (attempt + 1))
     raise last
+
+
+def bitrix_call(method, params):
+    req = urllib.request.Request(f"{BITRIX}/{method}.json", data=json.dumps(params).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{method}: {e.read().decode(errors='replace')[:300]}") from e
+    if "error" in data:
+        raise RuntimeError(f"{method}: {data.get('error')} {data.get('error_description', '')}")
+    return data.get("result")
+
+
+def bitrix_dialog():
+    d = os.environ.get("BITRIX_ALERT_DIALOG", "").strip()
+    if d:
+        return d
+    m = re.search(r"/rest/(\d+)/", BITRIX + "/")  # владелец вебхука
+    if not m:
+        raise RuntimeError("не задан BITRIX_ALERT_DIALOG и в адресе вебхука нет id пользователя")
+    return m.group(1)
+
+
+def send_bitrix(text, html=False):
+    bots = bitrix_call("imbot.bot.list", {"CLIENT_ID": BITRIX_CLIENT_ID}) or {}
+    bot = next((int(b["ID"]) for b in (bots.values() if isinstance(bots, dict) else bots)
+                if str(b.get("CODE")) == BITRIX_BOT_CODE), None)
+    if bot is None:
+        raise RuntimeError("бот «Helper for 1St» не найден в Битрикс24 (его регистрирует агент)")
+    if html:
+        text = re.sub(r"</?b>", lambda m: "[/b]" if m.group(0).startswith("</") else "[b]", text)
+        text = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    bitrix_call("imbot.message.add", {"BOT_ID": bot, "CLIENT_ID": BITRIX_CLIENT_ID,
+                                      "DIALOG_ID": bitrix_dialog(), "MESSAGE": text, "URL_PREVIEW": "N"})
+
+
+def notify(text, html=False):
+    """Битрикс24; если не настроен или не ответил — запасной канал Telegram."""
+    if BITRIX:
+        try:
+            send_bitrix(text, html)
+            return
+        except Exception as e:
+            print(f"Битрикс24: не отправлено: {e}")
+            if not (TOKEN and ALERT_CHAT):
+                raise
+            text = "(Битрикс24 недоступен: " + str(e)[:150] + ")\n\n" + text
+    kw = {"parse_mode": "HTML"} if html else {"disable_web_page_preview": True}
+    tg("sendMessage", chat_id=ALERT_CHAT, text=text, **kw)
 
 
 def is_workday(now):
@@ -127,7 +183,7 @@ def check_telegram_in_log(run):
         text = z.read(name).decode("utf-8", "ignore")
         for line in text.splitlines():
             if any(m in line for m in TG_ERROR_MARKERS):
-                return {"tg_send": f"В логе агента ошибка отправки в Telegram: {line.split('Z ', 1)[-1][:200]} ({run['html_url']})"}
+                return {"tg_send": f"В логе агента ошибка отправки сообщения: {line.split('Z ', 1)[-1][:200]} ({run['html_url']})"}
     return {}
 
 
@@ -168,6 +224,8 @@ def check_minutes(now_utc):
 
 def check_bot():
     problems = {}
+    if BITRIX or not TOKEN:  # агент пишет в Битрикс24, Telegram у него выключен
+        return problems
     try:
         me = tg("getMe")
         if not me.get("ok"):
@@ -409,14 +467,13 @@ def main():
     state["alerts"] = new_alerts
     print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} события={len(events)} отправляем={len(lines)}")
     if lines:
-        tg("sendMessage", chat_id=ALERT_CHAT, text="Страж агента\n\n" + "\n\n".join(lines),
-           disable_web_page_preview=True)
+        notify("Страж агента\n\n" + "\n\n".join(lines))
     if summary:
-        tg("sendMessage", chat_id=ALERT_CHAT, text=summary, parse_mode="HTML")
+        notify(summary, html=True)
         print("сводка отправлена:", summary.replace("\n", " | ")[:400])
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
-        tg("sendMessage", chat_id=ALERT_CHAT, text="Страж: тестовое сообщение. Канал тревог работает.")
+        notify("Страж: тестовое сообщение. Канал тревог работает.")
 
 
 if __name__ == "__main__":
