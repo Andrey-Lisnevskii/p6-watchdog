@@ -255,6 +255,7 @@ NONE_RE = re.compile(r"^- (?P<date>[^|]+?) \| тема: (?P<subj>.*?) \| от: .
 CLOSE_RE = re.compile(r"Сверка П(?P<n>\d+): заявка (?P<t>\d\d:\d\d)(?!\d)")
 REMIND_RE = re.compile(r"Напоминание (?P<k>\d) отправлено П(?P<n>\d+) на (?P<addr>\S+)")
 SEEN_TTL_H = 12
+LETTER_DATE_RE = re.compile(r"Письмо: (?P<d>\d{1,2})\.(?P<m>\d{1,2}) \d{1,2}:\d{2}")
 
 
 def run_lines(run):
@@ -353,6 +354,9 @@ def scan_agent_logs(state, now_utc):
         for line in lines:
             if line.startswith("⚠️") and "в чат не отправляется" in line:
                 text = line.split(" — в чат")[0]
+                ml = LETTER_DATE_RE.search(text)
+                if ml and (int(ml["d"]), int(ml["m"])) != (today.day, today.month):
+                    continue  # письмо вчерашнее (агент читает почту за последние сутки) — сегодня о нём не пишем
                 if once(text):
                     events.append(f"ℹ️ Агент не смог разобрать письмо, в чат отдела оно не ушло. {text[2:].strip()} ({r['html_url']})")
                 continue
