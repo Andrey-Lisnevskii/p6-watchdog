@@ -250,8 +250,10 @@ def minutes_line(now_utc, now):
     days = [datetime(y, m, d) for d in range(1, calendar.monthrange(y, m)[1] + 1)]
     wd_total = sum(1 for d in days if d.weekday() < 5)
     wd_done = sum(1 for d in days if d.weekday() < 5 and d.day <= now.day)
-    norm = plan / wd_total
-    day_pct = round(today_used * 100 / norm)
+    # дневная норма = остаток плана на начало дня / оставшиеся рабочие дни (включая сегодня)
+    left_wd = max(wd_total - wd_done + 1, 1)
+    norm = max(plan - (used - today_used), 0) / left_wd
+    day_pct = round(today_used * 100 / norm) if norm else 999
     forecast = round(used / max(wd_done, 1) * wd_total)
     month_pct = round(used * 100 / plan)
     mark = "🟢" if day_pct <= 100 else "🟠" if day_pct <= 120 else "🔴"
