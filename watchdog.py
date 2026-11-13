@@ -208,6 +208,28 @@ def minutes_used(now_utc):
     return total + int(os.environ.get("MINUTES_OFFSET", "0"))
 
 
+def minutes_line(now_utc, now):
+    """Одна строка: израсходованные минуты Actions, % от лимита и прогноз на месяц (по рабочим дням)."""
+    quota = int(os.environ.get("MINUTES_QUOTA", "2000"))
+    try:
+        used = minutes_used(now_utc)
+    except Exception as e:
+        print("минуты: не удалось посчитать:", e)
+        return ""
+    import calendar
+    y, m = now.year, now.month
+    days = [datetime(y, m, d) for d in range(1, calendar.monthrange(y, m)[1] + 1)]
+    wd_total = sum(1 for d in days if d.weekday() < 5)
+    wd_done = sum(1 for d in days if d.weekday() < 5 and d.day <= now.day)
+    forecast = round(used / max(wd_done, 1) * wd_total)
+    pct = round(used * 100 / quota)
+    mark = "🔴" if pct >= 95 else "🟠" if pct >= 80 else "🟢"
+    fc_note = " — не хватит" if forecast > quota else ""
+    fmt = lambda n: f"{n:,}".replace(",", " ")
+    return (f"{mark} Минуты GitHub: ~{fmt(used)} из {fmt(quota)} ({pct}% лимита), "
+            f"прогноз на месяц ~{fmt(forecast)}{fc_note}")
+
+
 def check_minutes(now_utc):
     quota = int(os.environ.get("MINUTES_QUOTA", "2000"))
     try:
@@ -468,6 +490,9 @@ def main():
         due = workday and (now.hour, now.minute) >= (18, 0) and not day.get("final_sent")
         if due or os.environ.get("TEST_ALERT"):
             summary = build_summary(day, now)
+            ml = minutes_line(datetime.now(timezone.utc), now)
+            if ml:
+                summary += "\n\n" + ml
             if due:
                 day["final_sent"] = True
     state["alerts"] = new_alerts
