@@ -189,11 +189,12 @@ def check_telegram_in_log(run):
     return {}
 
 
-def minutes_used(now_utc):
-    """Оценка израсходованных минут Actions в закрытом репозитории агента за текущий месяц.
-    Каждый запуск округляется вверх до целой минуты (как биллинг GitHub для одного job)."""
+def minutes_stats(now_utc):
+    """(минут за месяц, минут за сегодняшний день МСК) по запускам Actions закрытого репозитория."""
     since = now_utc.strftime("%Y-%m-01")
-    total, page = 0, 1
+    today = now_utc.astimezone(MSK).date()
+    total = day = 0
+    page = 1
     while page <= 40:
         runs = gh(f"/repos/{AGENT_REPO}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
                   ).get("workflow_runs", [])
@@ -201,7 +202,34 @@ def minutes_used(now_utc):
             if r["status"] != "completed" or not r.get("run_started_at"):
                 continue
             sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
-            total += max(1, -(-int(sec) // 60))
+            mins = max(1, -(-int(sec) // 60))
+            total += mins
+            if parse(r["run_started_at"]).astimezone(MSK).date() == today:
+                day += mins
+        if len(runs) < 100:
+            break
+        page += 1
+    return total + int(os.environ.get("MINUTES_OFFSET", "0")), day
+
+
+def minutes_used(now_utc):
+    """Оценка израсходованных минут Actions в закрытом репозитории агента за текущий месяц.
+    Каждый запуск округляется вверх до целой минуты (как биллинг GitHub для одного job)."""
+    since = now_utc.strftime("%Y-%m-01")
+    total, page = 0, 1
+    minutes_used.today = 0
+    today_msk = now_utc.astimezone(MSK).date()
+    while page <= 40:
+        runs = gh(f"/repos/{AGENT_REPO}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
+                  ).get("workflow_runs", [])
+        for r in runs:
+            if r["status"] != "completed" or not r.get("run_started_at"):
+                continue
+            sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
+            mins = max(1, -(-int(sec) // 60))
+            total += mins
+            if parse(r["run_started_at"]).astimezone(MSK).date() == today_msk:
+                minutes_used.today += mins
         if len(runs) < 100:
             break
         page += 1
@@ -209,25 +237,28 @@ def minutes_used(now_utc):
 
 
 def minutes_line(now_utc, now):
-    """Одна строка: израсходованные минуты Actions, % от лимита и прогноз на месяц (по рабочим дням)."""
-    quota = int(os.environ.get("MINUTES_QUOTA", "2000"))
+    """Одна строка: минуты Actions за день к дневной норме (план месяца / рабочие дни) и за месяц с прогнозом."""
+    plan = int(os.environ.get("MINUTES_PLAN", "1950"))
     try:
         used = minutes_used(now_utc)
     except Exception as e:
         print("минуты: не удалось посчитать:", e)
         return ""
+    today_used = getattr(minutes_used, "today", 0)
     import calendar
     y, m = now.year, now.month
     days = [datetime(y, m, d) for d in range(1, calendar.monthrange(y, m)[1] + 1)]
     wd_total = sum(1 for d in days if d.weekday() < 5)
     wd_done = sum(1 for d in days if d.weekday() < 5 and d.day <= now.day)
+    norm = plan / wd_total
+    day_pct = round(today_used * 100 / norm)
     forecast = round(used / max(wd_done, 1) * wd_total)
-    pct = round(used * 100 / quota)
-    mark = "🔴" if pct >= 95 else "🟠" if pct >= 80 else "🟢"
-    fc_note = " — не хватит" if forecast > quota else ""
+    month_pct = round(used * 100 / plan)
+    mark = "🟢" if day_pct <= 100 else "🟠" if day_pct <= 120 else "🔴"
     fmt = lambda n: f"{n:,}".replace(",", " ")
-    return (f"{mark} Минуты GitHub: ~{fmt(used)} из {fmt(quota)} ({pct}% лимита), "
-            f"прогноз на месяц ~{fmt(forecast)}{fc_note}")
+    return (f"{mark} Минуты GitHub за день: {today_used} из нормы {norm:.0f} ({day_pct}%)\n"
+            f"За месяц: ~{fmt(used)} из плана {fmt(plan)} ({month_pct}%), прогноз ~{fmt(forecast)}"
+            f"{' — выше плана' if forecast > plan else ''}")
 
 
 def check_minutes(now_utc):
@@ -496,6 +527,8 @@ def main():
             if due:
                 day["final_sent"] = True
     state["alerts"] = new_alerts
+    if working:
+        print("МИНУТЫ:", minutes_line(datetime.now(timezone.utc), now))
     print(f"{now:%d.%m %H:%M} рабочее время={working} проблемы={list(problems)} события={len(events)} отправляем={len(lines)}")
     if lines:
         notify("Страж агента\n\n" + "\n\n".join(lines))
