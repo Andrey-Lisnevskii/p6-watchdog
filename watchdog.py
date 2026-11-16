@@ -28,6 +28,7 @@ MSK = ZoneInfo("Europe/Moscow")
 WORK_START, WORK_END = (9, 30), (17, 30)
 MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "20"))
 MIN_LEFT_ALERT = int(os.environ.get("MIN_LEFT_ALERT", "100"))
+QUEUE_ALERT_MIN = int(os.environ.get("QUEUE_ALERT_MIN", "10"))
 REPEAT_MIN = 60          # повтор той же тревоги не чаще раза в час
 STATE_FILE = "state.json"
 TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось", "Битрикс24: не отправлено")
@@ -163,6 +164,18 @@ def check_runs(now_utc, working):
             problems["silence"] = (f"Агент не запускался {int(age)} мин "
                                    f"(последний запуск {parse(last['created_at']).astimezone(MSK):%H:%M}). "
                                    f"Проверьте задание в cron-job.org и лимит минут GitHub.")
+    # агент работает на компьютере в офисе (self-hosted runner): если компьютер выключен или runner
+    # не на связи, запуски молча копятся в очереди — сообщаем, если запуск ждёт дольше 10 минут
+    waiting = [r for r in runs if r["status"] in ("queued", "waiting", "pending")]
+    if waiting:
+        oldest = min(parse(r["created_at"]) for r in waiting)
+        wait_min = (now_utc - oldest).total_seconds() / 60
+        if wait_min > QUEUE_ALERT_MIN:
+            problems["queued"] = (f"Агент стоит в очереди {int(wait_min)} мин и не выполняется "
+                                  f"(запусков в очереди: {len(waiting)}). Вероятно, компьютер с runner выключен "
+                                  f"или нет связи с GitHub. Включите компьютер или проверьте службу "
+                                  f"«GitHub Actions Runner». Вернуть запуск в облако: удалить переменную RUNNER "
+                                  f"в Settings → Secrets and variables → Actions → Variables.")
     done = [r for r in runs if r["status"] == "completed"]
     bad = ("failure", "timed_out", "startup_failure")
     # одиночный сбой (например, обрыв IMAP у mail.ru) не тревожит: агент перезапускается сам каждые 6 минут
