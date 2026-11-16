@@ -221,12 +221,14 @@ def _run_billed_minutes(repo, r, budget):
             t = gh(f"/repos/{repo}/actions/runs/{r['id']}/timing")
             billable = t.get("billable")
             if billable is not None:
-                mins = 0
-                for os_name, v in billable.items():
-                    for jr in v.get("job_runs") or []:
-                        mins += max(1, -(-int(jr.get("duration_ms", 0)) // 60000))
-                    if not v.get("job_runs") and v.get("total_ms"):
-                        mins += max(1, -(-int(v["total_ms"]) // 60000))
+                # GitHub больше не отдаёт длительность в billable (там 0), но по нему видно, где шёл запуск:
+                # облачные job перечислены (UBUNTU/WINDOWS/MACOS), запуски на своём компьютере — нет.
+                cloud_jobs = sum(len(v.get("job_runs") or []) or int(v.get("jobs") or 0) for v in billable.values())
+                if cloud_jobs == 0:
+                    mins = 0
+                else:
+                    ms = int(t.get("run_duration_ms") or 0)
+                    mins = max(cloud_jobs, -(-ms // 60000))
                 BILLED[key] = mins
                 return mins
         except Exception as e:
@@ -518,7 +520,7 @@ def main():
     now = now_utc.astimezone(MSK)
     try:  # кэш посчитанных минут по запускам (до подсчёта минут)
         _st = json.load(open(STATE_FILE))
-        if _st.get("billed_month") == now.strftime("%Y-%m"):
+        if _st.get("billed_month") == now.strftime("%Y-%m") + "/v2":
             BILLED.update(_st.get("billed", {}))
     except Exception:
         pass
@@ -581,7 +583,7 @@ def main():
     if summary:
         notify(summary, html=True)
         print("сводка отправлена:", summary.replace("\n", " | ")[:400])
-    state["billed"], state["billed_month"] = BILLED, datetime.now(MSK).strftime("%Y-%m")
+    state["billed"], state["billed_month"] = BILLED, datetime.now(MSK).strftime("%Y-%m") + "/v2"
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
         notify("Страж: тестовое сообщение. Канал тревог работает.")
