@@ -26,9 +26,11 @@ AGENT_WORKFLOW = "agent.yml"
 GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "-1004300461257")
 MSK = ZoneInfo("Europe/Moscow")
 WORK_START, WORK_END = (9, 30), (17, 30)
-MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "20"))
+MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "40"))  # страховочные запуски раз в 30 мин
 MIN_LEFT_ALERT = int(os.environ.get("MIN_LEFT_ALERT", "100"))
 QUEUE_ALERT_MIN = int(os.environ.get("QUEUE_ALERT_MIN", "10"))
+# с этого момента часть запусков идёт на компьютере в офисе; такие запуски в расход минут не считаем
+SELF_HOSTED_SINCE = datetime(2026, 11, 16, 10, 50, tzinfo=timezone.utc)
 REPEAT_MIN = 60          # повтор той же тревоги не чаще раза в час
 STATE_FILE = "state.json"
 TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось", "Битрикс24: не отправлено")
@@ -214,6 +216,8 @@ def minutes_stats(now_utc):
         for r in runs:
             if r["status"] != "completed" or not r.get("run_started_at"):
                 continue
+            if parse(r["created_at"]) >= SELF_HOSTED_SINCE and _self_hosted(r["id"]):
+                continue  # запуск на своём компьютере (self-hosted runner) — минуты GitHub не тратит
             sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
             mins = max(1, -(-int(sec) // 60))
             total += mins
@@ -223,6 +227,20 @@ def minutes_stats(now_utc):
             break
         page += 1
     return total + int(os.environ.get("MINUTES_OFFSET", "0")), day
+
+
+_SH_CACHE = {}
+
+
+def _self_hosted(run_id):
+    """Выполнялся ли запуск на self-hosted runner (по меткам job). Ошибка запроса — считаем облачным."""
+    if run_id not in _SH_CACHE:
+        try:
+            jobs = gh(f"/repos/{AGENT_REPO}/actions/runs/{run_id}/jobs").get("jobs", [])
+            _SH_CACHE[run_id] = bool(jobs) and all("self-hosted" in (j.get("labels") or []) for j in jobs)
+        except Exception:
+            _SH_CACHE[run_id] = False
+    return _SH_CACHE[run_id]
 
 
 def minutes_used(now_utc):
