@@ -244,6 +244,7 @@ def minutes_used(now_utc):
     today_msk = now_utc.astimezone(MSK).date()
     total = 0
     minutes_used.today = 0
+    minutes_used.by_day = {}
     minutes_used.by_repo = {}
     minutes_used.no_access = []
     budget = [MAX_NEW_TIMINGS]
@@ -264,7 +265,9 @@ def minutes_used(now_utc):
                     continue
                 mins = _run_billed_minutes(repo, r, budget)
                 repo_total += mins
-                if parse(r["run_started_at"]).astimezone(MSK).date() == today_msk:
+                d = parse(r["run_started_at"]).astimezone(MSK).date()
+                minutes_used.by_day[d] = minutes_used.by_day.get(d, 0) + mins
+                if d == today_msk:
                     minutes_used.today += mins
             if len(runs) < 100:
                 break
@@ -292,7 +295,13 @@ def minutes_line(now_utc, now):
     left_wd = max(wd_total - wd_done + 1, 1)
     norm = max(plan - (used - today_used), 0) / left_wd
     day_pct = round(today_used * 100 / norm) if norm else 999
-    forecast = round(used / max(wd_done, 1) * wd_total)
+    # прогноз: израсходованное + темп последнего рабочего дня × оставшиеся рабочие дни после сегодняшнего
+    # (средний темп с начала месяца врёт после перехода на свой компьютер, когда расход упал почти до нуля)
+    by_day = getattr(minutes_used, "by_day", {})
+    past = sorted(d for d in by_day if d < now.date() and d.weekday() < 5)
+    rate = by_day[past[-1]] if past else (used / max(wd_done, 1))
+    rate = min(rate, today_used) if now.hour >= 18 else rate  # вечером сегодняшний день уже показателен
+    forecast = round(used + rate * max(wd_total - wd_done, 0))
     month_pct = round(used * 100 / plan)
     mark = "🟢" if day_pct <= 100 else "🟠" if day_pct <= 120 else "🔴"
     fmt = lambda n: f"{n:,}".replace(",", " ")
