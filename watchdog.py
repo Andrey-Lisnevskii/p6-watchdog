@@ -29,8 +29,6 @@ WORK_START, WORK_END = (9, 30), (17, 30)
 MAX_SILENCE_MIN = int(os.environ.get("MAX_SILENCE_MIN", "40"))  # страховочные запуски раз в 30 мин
 MIN_LEFT_ALERT = int(os.environ.get("MIN_LEFT_ALERT", "100"))
 QUEUE_ALERT_MIN = int(os.environ.get("QUEUE_ALERT_MIN", "10"))
-# с этого момента часть запусков идёт на компьютере в офисе; такие запуски в расход минут не считаем
-SELF_HOSTED_SINCE = datetime(2026, 11, 16, 10, 50, tzinfo=timezone.utc)
 REPEAT_MIN = 60          # повтор той же тревоги не чаще раза в час
 STATE_FILE = "state.json"
 TG_ERROR_MARKERS = ("Telegram вернул ошибку", "Telegram отклонил", "Telegram: не удалось", "Битрикс24: не отправлено")
@@ -204,66 +202,73 @@ def check_telegram_in_log(run):
     return {}
 
 
-def minutes_stats(now_utc):
-    """(минут за месяц, минут за сегодняшний день МСК) по запускам Actions закрытого репозитория."""
-    since = now_utc.strftime("%Y-%m-01")
-    today = now_utc.astimezone(MSK).date()
-    total = day = 0
-    page = 1
-    while page <= 40:
-        runs = gh(f"/repos/{AGENT_REPO}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
-                  ).get("workflow_runs", [])
-        for r in runs:
-            if r["status"] != "completed" or not r.get("run_started_at"):
-                continue
-            if parse(r["created_at"]) >= SELF_HOSTED_SINCE and _self_hosted(r["id"]):
-                continue  # запуск на своём компьютере (self-hosted runner) — минуты GitHub не тратит
-            sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
-            mins = max(1, -(-int(sec) // 60))
-            total += mins
-            if parse(r["run_started_at"]).astimezone(MSK).date() == today:
-                day += mins
-        if len(runs) < 100:
-            break
-        page += 1
-    return total + int(os.environ.get("MINUTES_OFFSET", "0")), day
+# Репозитории, чьи запуски тратят минуты аккаунта (публичные GitHub не тарифицирует и они пропускаются сами).
+MINUTES_REPOS = [r.strip() for r in os.environ.get(
+    "MINUTES_REPOS", "Andrey-Lisnevskii/p6-reminder,Andrey-Lisnevskii/1St-Original").split(",") if r.strip()]
+BILLED = {}          # "repo#run_id" -> оплачиваемые минуты завершённого запуска (кэш в state.json)
+MAX_NEW_TIMINGS = 300  # не больше стольких новых запросов за один проход стража
 
 
-_SH_CACHE = {}
-
-
-def _self_hosted(run_id):
-    """Выполнялся ли запуск на self-hosted runner (по меткам job). Ошибка запроса — считаем облачным."""
-    if run_id not in _SH_CACHE:
+def _run_billed_minutes(repo, r, budget):
+    """Оплачиваемые минуты одного завершённого запуска: по данным GitHub (каждый облачный job округляется
+    вверх до минуты, запуски на своём компьютере — 0). Без запроса — оценка по длительности запуска."""
+    key = f"{repo}#{r['id']}"
+    if key in BILLED:
+        return BILLED[key]
+    if budget[0] > 0:
+        budget[0] -= 1
         try:
-            jobs = gh(f"/repos/{AGENT_REPO}/actions/runs/{run_id}/jobs").get("jobs", [])
-            _SH_CACHE[run_id] = bool(jobs) and all("self-hosted" in (j.get("labels") or []) for j in jobs)
-        except Exception:
-            _SH_CACHE[run_id] = False
-    return _SH_CACHE[run_id]
+            t = gh(f"/repos/{repo}/actions/runs/{r['id']}/timing")
+            billable = t.get("billable")
+            if billable is not None:
+                mins = 0
+                for os_name, v in billable.items():
+                    for jr in v.get("job_runs") or []:
+                        mins += max(1, -(-int(jr.get("duration_ms", 0)) // 60000))
+                    if not v.get("job_runs") and v.get("total_ms"):
+                        mins += max(1, -(-int(v["total_ms"]) // 60000))
+                BILLED[key] = mins
+                return mins
+        except Exception as e:
+            print(f"минуты: timing {key}: {e}")
+    sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
+    return max(1, -(-int(sec) // 60))
 
 
 def minutes_used(now_utc):
-    """Оценка израсходованных минут Actions в закрытом репозитории агента за текущий месяц.
-    Каждый запуск округляется вверх до целой минуты (как биллинг GitHub для одного job)."""
+    """Израсходованные минуты Actions за текущий месяц по всем закрытым репозиториям аккаунта.
+    minutes_used.today — за сегодня (МСК); minutes_used.by_repo; minutes_used.no_access — куда нет доступа."""
     since = now_utc.strftime("%Y-%m-01")
-    total, page = 0, 1
-    minutes_used.today = 0
     today_msk = now_utc.astimezone(MSK).date()
-    while page <= 40:
-        runs = gh(f"/repos/{AGENT_REPO}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
-                  ).get("workflow_runs", [])
-        for r in runs:
-            if r["status"] != "completed" or not r.get("run_started_at"):
-                continue
-            sec = (parse(r["updated_at"]) - parse(r["run_started_at"])).total_seconds()
-            mins = max(1, -(-int(sec) // 60))
-            total += mins
-            if parse(r["run_started_at"]).astimezone(MSK).date() == today_msk:
-                minutes_used.today += mins
-        if len(runs) < 100:
-            break
-        page += 1
+    total = 0
+    minutes_used.today = 0
+    minutes_used.by_repo = {}
+    minutes_used.no_access = []
+    budget = [MAX_NEW_TIMINGS]
+    for repo in MINUTES_REPOS:
+        try:
+            if not gh(f"/repos/{repo}").get("private", True):
+                continue  # публичный — бесплатно
+        except Exception as e:
+            minutes_used.no_access.append(repo)
+            print(f"минуты: нет доступа к {repo}: {e}")
+            continue
+        repo_total, page = 0, 1
+        while page <= 40:
+            runs = gh(f"/repos/{repo}/actions/runs?per_page=100&page={page}&created=%3E%3D{since}"
+                      ).get("workflow_runs", [])
+            for r in runs:
+                if r["status"] != "completed" or not r.get("run_started_at"):
+                    continue
+                mins = _run_billed_minutes(repo, r, budget)
+                repo_total += mins
+                if parse(r["run_started_at"]).astimezone(MSK).date() == today_msk:
+                    minutes_used.today += mins
+            if len(runs) < 100:
+                break
+            page += 1
+        minutes_used.by_repo[repo] = repo_total
+        total += repo_total
     return total + int(os.environ.get("MINUTES_OFFSET", "0"))
 
 
@@ -291,7 +296,9 @@ def minutes_line(now_utc, now):
     fmt = lambda n: f"{n:,}".replace(",", " ")
     return (f"{mark} Минуты GitHub за день: {today_used} из нормы {norm:.0f} ({day_pct}%)\n"
             f"За месяц: ~{fmt(used)} из плана {fmt(plan)} ({month_pct}%), прогноз ~{fmt(forecast)}"
-            f"{' — выше плана' if forecast > plan else ''}")
+            f"{' — выше плана' if forecast > plan else ''}"
+            + (f"\n⚠️ Нет доступа к {', '.join(getattr(minutes_used, 'no_access', []))} — минуты там не учтены"
+               if getattr(minutes_used, "no_access", []) else ""))
 
 
 def check_minutes(now_utc):
@@ -509,6 +516,12 @@ def parse_iso(ts):
 def main():
     now_utc = datetime.now(timezone.utc)
     now = now_utc.astimezone(MSK)
+    try:  # кэш посчитанных минут по запускам (до подсчёта минут)
+        _st = json.load(open(STATE_FILE))
+        if _st.get("billed_month") == now.strftime("%Y-%m"):
+            BILLED.update(_st.get("billed", {}))
+    except Exception:
+        pass
     working = is_working_time(now)
     workday = is_workday(now)
     problems = {}
@@ -568,6 +581,7 @@ def main():
     if summary:
         notify(summary, html=True)
         print("сводка отправлена:", summary.replace("\n", " | ")[:400])
+    state["billed"], state["billed_month"] = BILLED, datetime.now(MSK).strftime("%Y-%m")
     json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False)
     if os.environ.get("TEST_ALERT"):
         notify("Страж: тестовое сообщение. Канал тревог работает.")
