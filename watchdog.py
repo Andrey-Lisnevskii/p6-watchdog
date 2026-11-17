@@ -479,6 +479,37 @@ def scan_agent_logs(state, now_utc):
     return [] if first else events
 
 
+PRICE_SUBJECTS = ["П21 прайс микрооптовые", "Прайс микрооптовые_Отливанты п50"]
+PRICE_SENT_RE = re.compile(r"отправлено: «(?P<s>[^»]+)»|«(?P<d>[^»]+)»: сегодня уже отправлено")
+
+
+def prices_line(now_utc):
+    """Строка для сводки: ушли ли сегодня оба прайса igells (по логам запусков рассылки)."""
+    today = now_utc.astimezone(MSK).date()
+    since = datetime.combine(today, datetime.min.time(), MSK).astimezone(timezone.utc)
+    try:
+        runs = gh(f"/repos/{AGENT_REPO}/actions/workflows/price-mailing.yml/runs?per_page=20"
+                  f"&created=%3E%3D{since:%Y-%m-%dT%H:%M:%SZ}").get("workflow_runs", [])
+        sent = set()
+        for r in runs:
+            if r["status"] != "completed":
+                continue
+            for line in run_lines(r):
+                m = PRICE_SENT_RE.search(line)
+                if m:
+                    sent.add((m["s"] or m["d"]).strip())
+    except Exception as e:
+        return f"⚪ Прайсы igells: не удалось проверить ({str(e)[:80]})"
+    if not runs:
+        return "⚪ Прайсы igells: сегодня рассылка не запускалась"
+    missing = [s for s in PRICE_SUBJECTS if s not in sent]
+    if not missing:
+        return "🟢 Прайсы igells: отправлены оба"
+    if len(missing) == len(PRICE_SUBJECTS):
+        return "🔴 Прайсы igells: не отправлены — отправьте вручную"
+    return "🟠 Прайсы igells: не отправлен «" + "», «".join(missing) + "» — отправьте вручную"
+
+
 def build_summary(day, now):
     """Заявки по поставщикам: сколько отправлено и сколько закрыто сверкой; три группы."""
     orders = {}  # номер -> множество «чч:мм» заявок
@@ -578,6 +609,8 @@ def main():
         due = workday and (now.hour, now.minute) >= (18, 0) and not day.get("final_sent")
         if due or os.environ.get("TEST_ALERT"):
             summary = build_summary(day, now)
+            if is_workday(now):
+                summary += "\n\n" + prices_line(datetime.now(timezone.utc))
             ml = minutes_line(datetime.now(timezone.utc), now)
             if ml:
                 summary += "\n\n" + ml
