@@ -469,8 +469,8 @@ def scan_agent_logs(state, now_utc):
                 if rep and rep["dt"] < rt.isoformat():
                     text = (f"Напоминание поставщику П{m['n']} ушло в {rt:%H:%M}, хотя сегодня от него уже есть письмо "
                             f"({parse_iso(rep['dt']):%H:%M}, «{rep['subj']}»). Проверьте, не ответил ли он по существу")
-                    if once(text):
-                        events.append("⚠️ " + text)
+                    # 18.11: по просьбе пользователя такие сообщения больше не присылаем (только в лог)
+                    print("напоминание при наличии письма (не отправляется):", text)
     scanned |= {str(r["id"]) for r, _ in logs}
     state["scanned"] = sorted(scanned, key=int)[-300:]
     state["seen"] = {k: v for k, v in seen.items() if (now_utc.timestamp() - v) / 3600 < SEEN_TTL_H * 2}
