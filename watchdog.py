@@ -461,8 +461,7 @@ def scan_agent_logs(state, now_utc):
                 ml = LETTER_DATE_RE.search(text)
                 if ml and (int(ml["d"]), int(ml["m"])) != (today.day, today.month):
                     continue  # письмо вчерашнее (агент читает почту за последние сутки) — сегодня о нём не пишем
-                if once(text):
-                    events.append(f"ℹ️ Агент не смог разобрать письмо, в чат отдела оно не ушло. {text[2:].strip()} ({r['html_url']})")
+                # 18.11: по просьбе пользователя сообщения «агент не смог разобрать письмо» больше не присылаем
                 continue
             m = REMIND_RE.search(line)
             if m:
