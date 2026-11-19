@@ -607,12 +607,14 @@ def main():
         # один раз в день, в 18:00 (первый запуск после 18:00 в рабочий день)
         due = workday and (now.hour, now.minute) >= (18, 0) and not day.get("final_sent")
         if due or os.environ.get("TEST_ALERT"):
-            summary = build_summary(day, now)
+            # 19.11: «Итог дня по поставщикам» по просьбе пользователя больше не присылаем; остальное — как было
+            parts = []
             if is_workday(now):
-                summary += "\n\n" + prices_line(datetime.now(timezone.utc))
+                parts.append(prices_line(datetime.now(timezone.utc)))
             ml = minutes_line(datetime.now(timezone.utc), now)
             if ml:
-                summary += "\n\n" + ml
+                parts.append(ml)
+            summary = "\n\n".join(p for p in parts if p) or None
             if due:
                 day["final_sent"] = True
     state["alerts"] = new_alerts
